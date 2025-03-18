@@ -19,16 +19,15 @@ class LabelItem:
     using DirectLabelColormap (and the modified values in layer.colormap.color_dict).
     """
 
-    def __init__(self, index, layer, color_dictionary, name=None):
+    def __init__(self, index, layer, color_dictionary, color: tuple, name=None):
         self.label = index  # number of the label
         self.layer = layer  # associated image/labels layer
         # assign color dictionary
         self.color_dict = color_dictionary
         self.active = False  # state if it is selected for drawing
         self.visible = True  # shown in the viewer or not
-        self.color = self.color_dict[
-            self.label
-        ]  # this variable is never really used...
+        self.color = np.asarray(color)  # Store the color as NumPy array
+        self.color_dict[self.label] = self.color
         self.mem = None  # for remembering drawn pixels after erasing
         # (array with len axis = image len axis)
 
