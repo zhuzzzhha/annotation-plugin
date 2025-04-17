@@ -29,7 +29,7 @@ from click_counter import ClickCounter
 from graph_widget import myPyQtGraphWidget
 from label_widget import LabelItem
 from model import ScribblePromptUNet
-from plotter_widget import IoUPlotter
+from plotter_widget import IoUPlotter, BrPlotter
 from segment_anything.sam import ScribblePromptSAM
 from segment_widget import SegmentItem
 from timer_widget import TimerWidget
@@ -79,6 +79,7 @@ class AnnotationWidget(QtWidgets.QWidget):
         #Statistics
         self.iou = []
         self.clicks = []
+        self.segment_points = []
 
         self.brush_color_index = 0
         self.label_items_array = []
@@ -89,7 +90,9 @@ class AnnotationWidget(QtWidgets.QWidget):
         self.brush_iou_plotter = IoUPlotter(self.viewer)
         self.viewer.window.add_dock_widget(self.brush_iou_plotter, area='bottom', name="IoU/clicks")
         self.segment_iou_plotter = IoUPlotter(self.viewer)
+        self.brightness_plotter = BrPlotter(self.viewer)
         self.viewer.window.add_dock_widget(self.segment_iou_plotter, area='bottom', name="IoU/clicks")
+        self.viewer.window.add_dock_widget(self.brightness_plotter, area="bottom", name="Brightness")
         
         #Colors dict
         colors = self.colormap.colors[1:5]
@@ -102,6 +105,10 @@ class AnnotationWidget(QtWidgets.QWidget):
         self.network_color_dict[0] = "transparent"
         self.color_dict[None] = "transparent"
         self.color_dict[0] = "transparent"
+
+        self.label_click_counter = None
+        self.point_click_counter = None
+        self.shapes_layer = None
 
         # GUI elements
         init_image = QLabel("Select initial tomography image")
@@ -156,102 +163,80 @@ class AnnotationWidget(QtWidgets.QWidget):
 
     def on_prediction_click(self):
         img = self.get_current_slice_image_data()
-        height = img.height
-        width = img.width
-        tile_size = 128
-        overlap = 16
-        img_np = np.array(img)
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-        print(f"min {img_np.min()} max {img_np.max()}")
-        tiles = []
-        h, w = 128, 128
-        sp_unet = ScribblePromptSAM(version="v1")
-        output_mask = np.zeros((height, width))
+        original_shape = (img.height, img.width)
+        img = torch.tensor(np.asarray(img.resize((128,128)).convert('L')))/255
+        h,w = img.shape[-2:]
+        img = img[None,None,...].float()
 
-        for y in range(0, height, tile_size - overlap):
-            for x in range(0, width, tile_size - overlap):
-                y_start = y
-                x_start = x
-                y_end = min(y + tile_size, height)
-                x_end = min(x + tile_size, width)
+        pos_scribbles = np.zeros((h, w))
+        # pos_scribbles = cv2.line(pos_scribbles, (25,37), (35,20), color=1, thickness=1)
 
-                tile = img_np[y_start:y_end, x_start:x_end]
-                tile_tensor = torch.tensor(tile, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-                tiles.append(tile_tensor)
+        neg_scribbles = np.zeros((h, w))
+        # neg_scribbles = cv2.line(neg_scribbles, (10,100), (110,40), color=1, thickness=1)
 
-                pos_scribbles = self.get_scribbles_from_labels(1, y_start, y_end, x_start, x_end)
-                neg_scribbles = self.get_scribbles_from_labels(2, y_start, y_end, x_start, x_end)
+        pos_scribbles = self.get_scribbles_from_labels(1, (h,w))
+        neg_scribbles = self.get_scribbles_from_labels(2, (h,w))
+        # points = self.get_points_from_points_layer(1, (h,w))
+        # point_coords = torch.tensor(points)[np.newaxis, :, :]
+        # point_coords = point_coords.to(torch.int32)
+        # point_labels = torch.tensor(np.array([[1] * (point_coords.shape[1])], dtype=np.int32))
+        # point_labels[:, 1::2] = 0
 
-                if not(pos_scribbles is None and neg_scribbles is None):
-                    scribbles = np.stack([pos_scribbles, neg_scribbles])
-                    scribbles = torch.from_numpy(scribbles).unsqueeze(0)
-                else:
-                    scribbles = None
-                point_coords=None
-                point_labels=None
-                if self.has_points:
-                    points = self.get_points_from_points_layer()
-                    points_coords = []
-                    points_labels = []
-                    tile_points = []
-                    label = False
-                    for point in points:
-                        label = not label
-                        if y_start <= point[1] and point[1] <= y_end and x_start <= point[2] and point[2] <= x_end:
-                            tile_points.append(point)
-                            points_coords.append([int(point[1] - y_start), int(point[2] - x_start)])
-                            points_labels.append(int(label))
-                    if len(points_coords):
-                        point_coords = torch.tensor(points_coords).unsqueeze(0)
-                        point_labels = torch.tensor(points_labels).unsqueeze(0)
-                sp_unet = ScribblePromptSAM(version="v1")
-                if y_end - y_start < h or x_end - x_start < w:
-                    mask_unet = np.zeros((y_end - y_start, x_end - x_start))
-                    mask = mask_unet > 0.3    
-                    mask = mask.astype(np.uint8)
-                else:
-                    mask_unet, _, _ = sp_unet.predict(img=tile_tensor, scribbles=scribbles, point_coords=point_coords, point_labels=point_labels)
-                    mask = mask_unet.squeeze() > 0.5    
-                    mask = mask.numpy().astype(np.uint8)
-                output_mask[y_start:y_end, x_start:x_end] = mask
+        
+        point_coords = torch.tensor([[[ 29,  65],
+         [ 81,  27],
+         [103,  62],
+         [103,  17],
+         [ 49,  46], *self.segment_points]])
+        point_labels = torch.tensor(np.array([[1] * (point_coords.shape[1])], dtype=np.int32))
+        point_labels[:, 1::2] = 0
+        print(f'point_labels {point_labels}')
+        print(f'point_coords {point_coords}')
 
-        slice_idx = self.viewer.dims.current_step[0]
-    
-        self.network_mask.colormap = DirectLabelColormap(color_dict=self.network_color_dict)
-        self.network_mask.data[slice_idx] = output_mask
+        self.viewer.add_points(np.array([[65, 29], [27, 81], [62, 103], [17, 103], [46, 49]]), size = 2)
+        
+        if pos_scribbles is None and neg_scribbles is None:
+            scribbles = None
+        else: 
+            scribbles = np.stack([pos_scribbles, neg_scribbles])
+            scribbles = torch.from_numpy(scribbles).unsqueeze(0)
+
+
+        sp_unet = ScribblePromptUNet(version="v1")
+        mask_unet = sp_unet.predict(img=img, scribbles=scribbles, point_coords=point_coords, point_labels=point_labels)
+        mask = F.interpolate(mask_unet, size=original_shape, mode='bilinear').squeeze()
+        
+        mask = mask > 0.5
+        mask = mask.numpy().astype(np.uint8)
+        self.network_mask.data = mask
         self.network_mask.refresh()
         iou = self.calculate_iou()
+        print(f'iou {iou}')
         if self.label_click_counter is not None:
             label_clicks = self.label_click_counter.get_click_count()
             self.brush_iou_plotter.update_plot(iou, label_clicks)                    
-        if self.segment_iou_plotter is not None:
+        if self.point_click_counter is not None:
             segment_clicks = self.point_click_counter.get_click_count()
             self.segment_iou_plotter.update_plot(iou, segment_clicks)                    
 
 
-    def get_points_from_points_layer(self):
+    def get_points_from_points_layer(self, class_value, target_size):
         points_data = self.segments_layer.data
+        #resized_points = resize(points_data, target_size, order=0, preserve_range=True, anti_aliasing=False).astype(np.uint8)
+
         return points_data
 
-    def get_scribbles_from_labels(self,
-                                  class_value,
-                                  y_start,
-                                  y_end,
-                                  x_start,
-                                  x_end):
-        """Получение черточек из слоя обратной связи"""
+    def get_scribbles_from_labels(self, class_value, target_size):
         slice_idx = self.viewer.dims.current_step[0]
         if self.feedback_layer is not None:
             labels_data = self.feedback_layer.data[slice_idx]
             scribbles = (labels_data == class_value).astype(np.uint8)
-            tile = scribbles[y_start:y_end, x_start:x_end]
-            return tile
-
+            resized_scribbles = resize(scribbles, target_size, order=0, preserve_range=True, anti_aliasing=False).astype(np.uint8)
+            return resized_scribbles
 
     def get_current_slice_image_data(self) -> Image:
         """Получение текущего среза исходной томографии"""
-        slice_idx = self.viewer.dims.current_step[0]
-        image = Image.open(self.init_image_files[slice_idx])
+        image = Image.open(self.init_image_files[0])
         return image
 
     def on_select_init_image(self):
@@ -268,7 +253,7 @@ class AnnotationWidget(QtWidgets.QWidget):
             self.viewer.open(self.init_image_path)
             self.init_image = self.viewer.layers.selection.active
             self.init_image.blending = 'additive'
-            shape = self.init_image.data.compute().shape
+            shape = self.init_image.data.shape
             empty_labels = np.zeros(shape, dtype=np.uint8)
             self.network_mask = self.viewer.add_labels(empty_labels, name="Output mask")
             #self.points_layer = self.viewer.add_points([], name="Points")
@@ -290,6 +275,7 @@ class AnnotationWidget(QtWidgets.QWidget):
             self.versions_gt_directory_path = dialog.selectedFiles()[0]
         self.gt_files_list = [os.path.join(self.versions_gt_directory_path, d) for d in os.listdir(self.versions_gt_directory_path) if os.path.isfile(os.path.join(self.versions_gt_directory_path, d))]
         first_image_path = self.gt_files_list[0]
+        self.viewer.open(self.versions_gt_directory_path)
         first_image = imread(first_image_path)
         image_height, image_width = first_image.shape[:2] # обрабатываем и чб и цветные картинки
 
@@ -319,7 +305,7 @@ class AnnotationWidget(QtWidgets.QWidget):
 
     def compute_history_fp_volume(self, version_name):
         value = self.version_to_init_volume.get(version_name)
-        value = value.compute()
+        value = value
         fp_data = self.fp_feedback_data_array[0]
         for version in self.fp_feedback_data_array[1:]:
             fp_data |= version
@@ -404,69 +390,6 @@ class AnnotationWidget(QtWidgets.QWidget):
                 self.segment_grid_layout.addWidget(cur_qWidgets_list[j], index, j)
             #self.update_histogram_on_shape_change(index)
 
-    # def mouseBindings(self):
-        
-    #     @self.shapes_layer.mouse_drag_callbacks.append
-    #     def shape_mouse_drag_callback(layer, event):
-    #         ### respond to click+drag """
-    #         #print('shape_mouse_drag_callback() event.type:', event.type, 'event.pos:', event.pos, '')
-    #         self.lineShapeChange_callback(layer, event)
-    #         yield
-
-    #         while event.type == 'mouse_move':
-    #             self.lineShapeChange_callback(layer, event)
-    #             yield
-
-    # def updateLines(self, sliceNum, index):
-    #     """
-    #     data: two points that make the line
-    #     """
-    #     selectedDataList = self.shapes_layer.selected_data
-    #     index = selectedDataList[0]
-    #     data = self.shapes_layer.data[index]
-    #     src = data[0]
-    #     dst = data[1]
-    #     x, lineProfile, yFit, fwhm, leftIdx, rightIdx = self.plot_widget.analysis.lineProfile(sliceNum, src, dst, linewidth=1, doFit=True)
-
-    #     self.updateLineIntensityPlot(x, lineProfile, yFit, leftIdx, rightIdx)
-
-    # def _getSelectedShape(self):
-    #     # selected_data is a list of int with the index into self.shapeLayer.data of all selected shapes
-    #     selectedDataList = self.shapes_layer.selected_data
-    #     if len(selectedDataList) > 0:
-    #         index = selectedDataList.pop() # just the first selected shape
-    #         shapeType = self.shapes_layer.shape_types[index]
-    #         return shapeType, index, self.shapes_layer.data[index]
-    #     else:
-    #         return (None, None, None)
-
-    # def lineShapeChange_callback(self, layer, event):
-    #     """
-    #     Callback for when user clicks+drags to resize a line shape.
-
-    #     Responding to @self.shapeLayer.mouse_drag_callbacks
-
-    #     update pg plots with line intensity profile
-
-    #     get one selected line from list(self.shapeLayer.selected_data)
-    #     """
-
-    #     shapeType, index, data = self._getSelectedShape()
-    #     z = self.viewer.dims.current_step[0]
-
-    #     if shapeType == 'line':
-    #         self.updateLines(z, data)
-
-    # def updateLineIntensityPlot(self, x, oneProfile, fit=None, left_idx=np.nan, right_idx=np.nan): #, ind_lambda):
-    #     """
-    #     Update the pyqt graph (top one) with a new line profile
-
-    #     Parameters:
-    #         oneProfile: ndarray of line intensity
-    #     """
-
-    #     # new
-    #     self.myPyQtGraphWidget.updateLinePlot(x, oneProfile, fit, left_idx, right_idx)
 
     def create_standard_label_item_array(self):
         """
@@ -528,23 +451,55 @@ class AnnotationWidget(QtWidgets.QWidget):
 
         if len(points) %2 != 0:
             self.segments_layer.face_color[-1] = [1.0, 0.0, 0.0, 1.0]
-        # elif len(points) > 1:
-        #     num_points = 10
-        #     point1 = points[-1]
-        #     point2 = points[-2]
-        #     x_values = np.linspace(point1[0], point2[0], num_points).astype(int)
-        #     y_values = np.linspace(point1[1], point2[1], num_points).astype(int)
-            
-        #     z = self.viewer.dims.current_step[0]
-        #     # Получаем значения яркости пикселей под отрезком
-        #     brightness_values = self.init_image.data.compute()[z]
-        #     for idx in range(x_values):
-        #         print(f'brightness_values {brightness_values[y_values[idx]][x_values[idx]]}')
+
     def on_points_inserted(self, event):
         print(f'event.value {event.value}')
         self.segments_layer = event.value
         if isinstance(event.value, napari.layers.Points):
             self.point_click_counter = ClickCounter(self.segments_layer, self.clicks_count_segments)
+        if self.shapes_layer is None and isinstance(event.value, napari.layers.Shapes):
+            self.shapes_layer = event.value
+            self.shapes_layer.events.data.connect(self.print_shape)
         self.segments_layer.face_color = index_to_color_map[1]
         self.segments_layer.blending = 'translucent'
         self.segments_layer.events.data.connect(self.on_point_added)
+
+    def print_shape(self):
+        if len(self.shapes_layer.data):
+            first, second = self.shapes_layer.data[-1]
+            line_pixels, points = self.bresenham_line(*first, *second)
+            self.segment_points.extend([[points[0][1], points[0][0]], [points[0][1], points[0][0]]])
+            self.brightness_plotter.update_plot(line_pixels)
+
+    def bresenham_line(self, x0, y0, x1, y1):
+        print(f"x0 {x0} y0 {y0} x1 {x1} y1 {y1}")
+        x0 = int(x0)
+        x1 = int(x1)
+        y0 = int(y0)
+        y1 = int(y1)
+        points = []
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        while True:
+            points.append((x0, y0))
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+
+        brightness_values = []
+        img = self.get_current_slice_image_data()
+        for point in points:
+            brightness = img.getpixel((point[1], point[0]))  # napari использует (row, col) = (y, x)
+            brightness_values.append(brightness)
+        return brightness_values, points
+    

@@ -23,4 +23,4 @@ viewer.window.add_dock_widget(annotation_widget, area='right', name="Annotation 
 #viewer.window.add_dock_widget(plot_widget, area='right', name="Plot")
 
 
-napari.run()
+napari.run()    
