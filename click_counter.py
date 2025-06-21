@@ -6,13 +6,14 @@ class ClickCounter:
         self.layer = layer
         self.click_count = 0
         self.clicks_count_label = clicks_count_label
-        print(f'layer {type(layer)}')
         if isinstance(layer, napari.layers.Labels):
             self.layer.events.paint.connect(self.on_paint)
         elif isinstance(layer, napari.layers.Points):
             self.layer.events.data.connect(self.on_insert_point)
             self.num_points = 0
-        #self.feedback_layer.events.brush_size.connect(self.on_paint)
+        elif isinstance(layer, napari.layers.Shapes):
+            self.layer.events.data.connect(self.on_insert_seg)
+            self.num_points = 0
 
     def on_paint(self, event):
         # Каждое событие paint считаем кликом
@@ -23,6 +24,11 @@ class ClickCounter:
         points = self.layer.data
         self.click_count += (len(points) - self.num_points)
         self.clicks_count_label.setText(f"Segments clicks count: {self.click_count}")
+        self.num_points = len(points)
+    
+    def on_insert_seg(self):
+        points = self.layer.data
+        self.click_count += (len(points) - self.num_points)
         self.num_points = len(points)
 
 
