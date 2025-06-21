@@ -1,5 +1,4 @@
-1. Для запуска необходимо запустить скрипт `entry_point.py`  
-   ![Скриншот запуска](https://github.com/user-attachments/assets/d7cfc427-0158-4f18-84ae-ff5502d81cff)
+1. Для запуска необходимо запустить скрипт `entry_point.py`
 
 2. Стартовый экран:  
    ![Стартовый экран](https://github.com/user-attachments/assets/29fd4fb0-c779-4794-992d-fb7b31e1d5ca)
