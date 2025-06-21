@@ -1,50 +1,55 @@
+from enum import Enum
 import pathlib
 import cv2
+from matplotlib.colors import LinearSegmentedColormap
+import napari.layers
 import torch
 import torch.nn.functional as F
 from datetime import datetime
-from magicgui import magicgui
+from magicgui import magic_factory, magicgui
+from collections import deque
+from itertools import product
 from matplotlib import pyplot as plt
 import napari
 import numpy as np
-from vedo import Volume
 import os
-from pathlib import Path
-from qtpy import QtWidgets, QtCore
+from qtpy import QtWidgets
 from PIL import Image
 from skimage.io import imread
-from skimage.measure import label
-from napari.layers import Image as napari_img
 from qtpy.QtWidgets import (
     QVBoxLayout,
     QPushButton,
-    QSlider,
     QLabel,
-    QComboBox,
     QFileDialog,
     QGridLayout,
-    QCheckBox,
     QMessageBox)
-from qtpy.QtCore import Qt
 from napari.utils.colormaps import (
     DirectLabelColormap,
     label_colormap,
 )
 
 from click_counter import ClickCounter
+from graph_widget import myPyQtGraphWidget
 from label_widget import LabelItem
-from model import ScribblePromptUNet, show_mask, show_scribbles
-from plotter_widget import IoUPlotter
-from predictor import Predictor
+from model import ScribblePromptUNet
+from plotter_widget import IoUPlotter, BrPlotter
+from segment_anything.sam import ScribblePromptSAM
 from segment_widget import SegmentItem
 from timer_widget import TimerWidget
 from skimage.transform import resize
+from skimage.draw import line
+from scipy.ndimage import binary_erosion, binary_dilation
+from skimage.segmentation import find_boundaries
 
-_maxLabels = 5
+class COLORS(Enum):
+    RED = 0
+    GREEN = 1
+    BLUE = 2
+
 index_to_color_map = {
     0: "red",
     1: "green",
-    2: "purple"
+    2: "blue"
 }
 
 file_dir = pathlib.Path(os.path.dirname(__file__))
@@ -59,109 +64,97 @@ class AnnotationWidget(QtWidgets.QWidget):
     def __init__(self, napari_viewer):
         super().__init__()
         self.viewer = napari_viewer
-        self.image_layer = self.viewer.layers.selection.active
-        self.feedback_layer = None
-        self.shapes_layer = self.viewer.add_shapes([], name="Segments")
-        self.segements_count = 0
-        self.fp_feedback_data_array = []
-        self.iou = []
-        self.clicks = []
 
+        #Layers
+        self.feedback_layer = None
+        self.segments_layer = None
+        self.gt_mask = None      
+
+        #Paths
         self.versions_directory_path = None
-        self.versions_list = []
         self.current_version_dir_path = None
         self.current_version_volume = None
 
-        self.brush_color_index = 0
-        self.label_items_array = []
-        self.segment_items_array = []
+        self.segements_count = 0
+        self.gt_volume = None
+        self.fp_feedback_data_array = []
         self.version_to_init_volume = dict()
         self.data_without_fp = dict()
-        self.ground_truth_path = pathlib.Path("D:\\reconstruction\\mask_versions\\3")
-        self.iou_plotter = IoUPlotter(self.viewer)
-        self.viewer.window.add_dock_widget(self.iou_plotter, area='right', name="IoU/clicks")
+        self.has_points = False
 
+        #Statistics
+        self.iou = []
+        self.clicks = []
+        self.segment_points = []
+        self.pos_points = []
+        self.neg_points = []
+
+        self.brush_color_index = 0
+        self.label_items_array = []
+        self.colormap = label_colormap(num_colors=4)
+        self.segment_items_array = []
         
-        self.colormap = label_colormap(num_colors=3)
-
-        # Получаем цвета из colormap, начиная с 1 (чтобы избежать фона)
-        colors = self.colormap.colors[1:4]
-
-        # Назначаем красный и зеленый цвета первым двум классам
-        colors[0] = np.array([0.0, 1.0, 0.0, 1.0])  # Красный
-        colors[1] = np.array([1.0, 0.0, 0.0, 1.0])  # Зеленый
-
-        # Создаем словарь colormap
-        self.color_dict = dict(enumerate(colors, start=1))
-
-        # Добавляем transparent цвет для None и 0
+        #Widgets
+        self.brush_iou_plotter = IoUPlotter(self.viewer)
+        self.viewer.window.add_dock_widget(self.brush_iou_plotter, area='bottom', name="IoU/clicks")
+        self.segment_iou_plotter = IoUPlotter(self.viewer)
+        self.brightness_plotter = BrPlotter(self.viewer)
+        self.viewer.window.add_dock_widget(self.segment_iou_plotter, area='bottom', name="IoU/clicks")
+        self.viewer.window.add_dock_widget(self.brightness_plotter, area="bottom", name="Brightness")
+        
+        #Colors dict
+        self.colors = self.colormap.colors[1:5]
+        self.colors[0] = np.array([0.0, 1.0, 0.0, 1.0])  # Зеленый
+        self.colors[1] = np.array([1.0, 0.0, 0.0, 1.0])  # Красный
+        self.colors[2] = np.array([0.0, 0.0, 1.0, 1.0])  # Синий
+        self.color_dict = dict(enumerate(self.colors, start=1))
+        self.network_color_dict = {1: self.colors[2]}
+        self.network_color_dict[None] = "transparent"
+        self.network_color_dict[0] = "transparent"
         self.color_dict[None] = "transparent"
         self.color_dict[0] = "transparent"
 
-        # GUI elements
-        init_image = QLabel("Select initial tomography image")
-        self.init_image_button = QPushButton("Select tomography directory")
-        version_directory_info = QLabel("Select mask version directory:")
-        self.select_directory_button = QPushButton("Select Directory")
-        mask_version_info = QLabel("Select version:")
-        gt_directory_info = QLabel("Select mask version directory:")
-        self.select_gt_directory_button = QPushButton("Select Ground truth directory")
+        self.label_click_counter = None
+        self.point_click_counter = None
+        self.shapes_layer = None
 
-        self.versions_combobox = QComboBox()
-        self.versions_combobox.addItem("No version selected")
+        # GUI elements
+        init_image = QLabel("Выберите исходное томографическое изображение")
+        self.init_image_button = QPushButton("Выберите папку с томографией")
+        self.select_gt_directory_button = QPushButton("Выберите папку с эталонной сегментацией")
         fp_checkbox_info = QLabel("Hide previous FP masks from versions: ")
         self.checkbox_grid_label = QGridLayout()
-        self.fp_versions_checkboxes = []
-
-
-        self.class_label = QLabel("Select Class:")
-        self.class_combobox = QComboBox()
-        self.class_combobox.addItem("TP") 
-        self.class_combobox.addItem("FP")
-        self.class_combobox.addItem("Unlabelled")
-
         self.create_labels_button = QPushButton("Start editing annotations")
         self.clicks_count_label = QLabel("Paint clicks count: ")
-        self.save_feedback_version = QPushButton("Save current feedback")
+        self.clicks_count_segments = QLabel("Segments clicks count: ")
+        self.save_feedback_version = QPushButton("Сохранить текущую маску")
         self.timer_widget = TimerWidget(self.viewer)
         self.create_label_item_array()
-        self.prediction_button = QPushButton("Make prediction")
+        self.prediction_button = QPushButton("Сформировать версию маски")
+        self.add_segment_button = QPushButton("Create new segment")
 
+        #Layout
         self.boxLayout = QVBoxLayout()
         self.boxLayout.setContentsMargins(0, 20, 0, 0)
         self.gridLayout = QGridLayout()
         self.segment_grid_layout = QGridLayout()
         self.setLayout(self.boxLayout)
-
         self.boxLayout.addWidget(init_image)
         self.boxLayout.addWidget(self.init_image_button)
-        self.boxLayout.addWidget(version_directory_info)
-        self.boxLayout.addWidget(self.select_directory_button)
-        self.boxLayout.addWidget(gt_directory_info)
         self.boxLayout.addWidget(self.select_gt_directory_button)
-        self.boxLayout.addWidget(mask_version_info)
-        self.boxLayout.addWidget(self.versions_combobox)
-        self.boxLayout.addWidget(fp_checkbox_info)
         self.boxLayout.addLayout(self.checkbox_grid_label)
-        self.boxLayout.addWidget(self.class_combobox)
-        self.boxLayout.addWidget(self.create_labels_button)
         self.boxLayout.addWidget(self.save_feedback_version)
-        self.boxLayout.addWidget(self.clicks_count_label)
         self.boxLayout.addWidget(self.timer_widget)
         self.boxLayout.addWidget(self.prediction_button)
         self.boxLayout.addLayout(self.gridLayout)
         self.boxLayout.addLayout(self.segment_grid_layout)
 
-
         # Connections
         self.init_image_button.clicked.connect(self.on_select_init_image)
-        self.select_directory_button.clicked.connect(self.on_select_directory)
-        self.versions_combobox.currentIndexChanged.connect(self.on_version_selected)
-        self.select_gt_directory_button.clicked.connect(self.on_gt_directory)
-        self.class_combobox.currentIndexChanged.connect(self.on_color_index_changed)
+        self.select_gt_directory_button.clicked.connect(self.on_select_gt_directory)
         self.create_labels_button.clicked.connect(self.on_create_feedback_layer)
         self.save_feedback_version.clicked.connect(self.on_save_current_feedback)
-        self.shapes_layer.events.data.connect(self.create_segment_item)
+        self.viewer.layers.events.inserted.connect(self.on_points_inserted)
         self.prediction_button.clicked.connect(self.on_prediction_click)
 
     def on_prediction_click(self):
@@ -172,38 +165,69 @@ class AnnotationWidget(QtWidgets.QWidget):
         img = img[None,None,...].float()
 
         pos_scribbles = np.zeros((h, w))
-        # pos_scribbles = cv2.line(pos_scribbles, (25,37), (35,20), color=1, thickness=1)
 
         neg_scribbles = np.zeros((h, w))
-        # neg_scribbles = cv2.line(neg_scribbles, (10,100), (110,40), color=1, thickness=1)
 
         pos_scribbles = self.get_scribbles_from_labels(1, (h,w))
         neg_scribbles = self.get_scribbles_from_labels(2, (h,w))
-        #points = self.get_points_from_points_layer(1, (h,w))
+        neg_points = []
+        for idx, point in enumerate(self.segment_points):
+            if idx%2 != 0:
+                self.neg_points.extend(self.dilation_around_point(point, 4, (128,128)))
+        point_coords = torch.tensor([[ [66, 26], *self.neg_points, *self.pos_points]])
+        point_labels = torch.tensor(np.array([[0] * (point_coords.shape[1])], dtype=np.int32))
+        point_labels[:, len(self.neg_points)+1:] = 1
 
-        scribbles = np.stack([pos_scribbles, neg_scribbles])
-        scribbles = torch.from_numpy(scribbles).unsqueeze(0)
-
+        
+        if pos_scribbles is None and neg_scribbles is None:
+            scribbles = None
+        else: 
+            scribbles = np.stack([pos_scribbles, neg_scribbles])
+            scribbles = torch.from_numpy(scribbles).unsqueeze(0)
 
         sp_unet = ScribblePromptUNet(version="v1")
-        mask_unet = sp_unet.predict(img=img, scribbles=scribbles)
+        mask_unet = sp_unet.predict(img=img, scribbles=scribbles, point_coords=point_coords, point_labels=point_labels)
         mask = F.interpolate(mask_unet, size=original_shape, mode='bilinear').squeeze()
+
         
-        mask = mask > 0.5
-        mask = mask.numpy().astype(np.uint8)
-        slice_idx = self.viewer.dims.current_step[0]
-        self.network_mask.data[slice_idx] = mask
+        bins = np.arange(0.1, 1.1, 0.1
+        quantized_mask = np.digitize(mask.cpu().numpy(), bins)  # Разбиваем на метки 1, 2, ..., 10
+
+        # Отображаем в napari (каждый label = свой цвет)
+        self.colormap_mask = label_colormap(num_colors=10)
+        colors = self.colormap_mask.colors[1:10]
+        colors[0] = np.array([0.133, 0.545, 0.133, 1.0])
+        colors[1] = np.array([0.2, 0.7, 0.1, 1.0])  
+        colors[2] = np.array([0.4, 0.8, 0.2, 1.0]) 
+        colors[3] = np.array([0.6, 0.9, 0.3, 1.0])  
+        colors[4] = np.array([0.8, 1.0, 0.4, 1.0]) 
+        colors[5] = np.array([1.0, 1.0, 0.5, 1.0]) 
+        colors[6] = np.array([1.0, 0.9, 0.0, 1.0])  
+        colors[7] = np.array([1.0, 0.7, 0.0, 1.0])  
+        colors[8] = np.array([1.0, 0.4, 0.0, 1.0])  
+
+
+
+        self.network_mask.data = quantized_mask
+        self.network_mask.colormap = self.colormap_mask
+
         self.network_mask.refresh()
-        iou = self.calculate_iou()
-        clicks = self.click_counter.get_click_count()
-        self.iou_plotter.update_plot(iou, clicks)
+        iou = self.calculate_iou(mask, self.gt_volume)
+        biou = self.boundary_iou(mask, self.gt_volume)
+        dice = self.dice_coefficient(mask, self.gt_volume)
+        if self.label_click_counter is not None:
+            label_clicks = self.label_click_counter.get_click_count()
+            self.brush_iou_plotter.update_plot(iou, label_clicks)                    
+        if self.point_click_counter is not None:
+            segment_clicks = self.point_click_counter.get_click_count()
+            seg_clicks = self.seg_click_counter.get_click_count()
+            self.segment_iou_plotter.update_plot(iou, segment_clicks)                    
+
 
     def get_points_from_points_layer(self, class_value, target_size):
-        slice_idx = self.viewer.dims.current_step[0]
-        points_data = self.points_layer.data
-        resized_points = resize(points_data, target_size, order=0, preserve_range=True, anti_aliasing=False).astype(np.uint8)
+        points_data = self.segments_layer.data
 
-        return resized_points
+        return points_data
 
     def get_scribbles_from_labels(self, class_value, target_size):
         slice_idx = self.viewer.dims.current_step[0]
@@ -213,14 +237,13 @@ class AnnotationWidget(QtWidgets.QWidget):
             resized_scribbles = resize(scribbles, target_size, order=0, preserve_range=True, anti_aliasing=False).astype(np.uint8)
             return resized_scribbles
 
-
     def get_current_slice_image_data(self) -> Image:
-        slice_idx = self.viewer.dims.current_step[0]
-        image = Image.open(self.init_image_files[slice_idx])
+        """Получение текущего среза исходной томографии"""
+        image = Image.open(self.init_image_files[0])
         return image
 
     def on_select_init_image(self):
-        """Открывает диалоговое окно выбора томографии."""
+        """Инициализация исходного томографического изображения"""
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.DirectoryOnly)
         if dialog.exec_():
@@ -232,55 +255,54 @@ class AnnotationWidget(QtWidgets.QWidget):
                     self.init_image_files.append(file_path)
             self.viewer.open(self.init_image_path)
             self.init_image = self.viewer.layers.selection.active
-            shape = self.init_image.data.compute().shape
+            self.init_image.blending = 'additive'
+            shape = self.init_image.data.shape
             empty_labels = np.zeros(shape, dtype=np.uint8)
             self.network_mask = self.viewer.add_labels(empty_labels, name="Output mask")
-            self.points_layer = self.viewer.add_points([], name="Points")
+            self.network_mask.face_color = index_to_color_map[2]
 
 
-    def on_select_directory(self):
-        """Открывает диалоговое окно выбора директории."""
+    def on_select_versions_directory(self):
+        """Инициализация списка файлов с версиями разметки"""
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.DirectoryOnly)
         if dialog.exec_():
             self.versions_directory_path = dialog.selectedFiles()[0]
-            self.fill_versions_list()
             self.fill_feedback_versions_list()
 
-    def on_gt_directory(self):
-        """Открывает диалоговое окно выбора директории c ground truth."""
+    def on_select_gt_directory(self):
+        """Инициализация объема с ground truth"""
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.DirectoryOnly)
         if dialog.exec_():
             self.versions_gt_directory_path = dialog.selectedFiles()[0]
         self.gt_files_list = [os.path.join(self.versions_gt_directory_path, d) for d in os.listdir(self.versions_gt_directory_path) if os.path.isfile(os.path.join(self.versions_gt_directory_path, d))]
         first_image_path = self.gt_files_list[0]
+        self.viewer.open(self.versions_gt_directory_path)
         first_image = imread(first_image_path)
-        image_height, image_width = first_image.shape[:2] # обрабатываем и чб и цветные картинки
+        image_height, image_width = first_image.shape[:2] 
 
-        # 3. Создаем NumPy array для хранения объемного изображения.
-        #    Размерность: (количество файлов, высота, ширина, количество каналов (если есть))
-        if len(first_image.shape) == 2: # Ч/Б изображение
+        if len(first_image.shape) == 2: 
             self.gt_volume = np.zeros((len(self.gt_files_list), image_height, image_width), dtype=first_image.dtype)
-        else:  # Цветное изображение
+        else:  
             num_channels = first_image.shape[2]
             self.gt_volume = np.zeros((len(self.gt_files_list), image_height, image_width, num_channels), dtype=first_image.dtype)
-
-
-        # 4. Читаем все PNG файлы и добавляем их в объемное изображение.
+        
         for i, filename in enumerate(self.gt_files_list):
             image_path = os.path.join( self.versions_gt_directory_path, filename)
             image = imread(image_path)
 
-            # Проверка соответствия размеров изображения (важно!)
             if image.shape[:2] != (image_height, image_width):
                 print(f"Ошибка: Размер изображения '{filename}' не соответствует размеру первого изображения.")
                 return None
 
             self.gt_volume[i] = image
+        self.gt_volume = self.gt_volume[0]
+        self.gt_mask = self.viewer.add_labels(self.gt_volume, name="GT mask")
+        self.gt_mask.face_color = index_to_color_map[1]
+
+
         
-
-
     def on_color_index_changed(self, value):
         """Вызывается при изменении индекса цвета кисти."""
         self.brush_color_index = value
@@ -291,7 +313,7 @@ class AnnotationWidget(QtWidgets.QWidget):
 
     def compute_history_fp_volume(self, version_name):
         value = self.version_to_init_volume.get(version_name)
-        value = value.compute()
+        value = value
         fp_data = self.fp_feedback_data_array[0]
         for version in self.fp_feedback_data_array[1:]:
             fp_data |= version
@@ -301,13 +323,13 @@ class AnnotationWidget(QtWidgets.QWidget):
         
 
     def on_create_feedback_layer(self):
-        """Создает слой feedback."""
+        """Создание слоя обратной связи и начало процесса разметки."""
         self.timer_widget.start_time = datetime.now()
-        if self.image_layer is None or not isinstance(self.image_layer, napari.layers.Image):
-            print("Please select an image layer first.")
+        if self.init_image is None:
+            print("Please select an init image first.")
             return
 
-        shape = self.image_layer.data.shape
+        shape = self.init_image.data.shape
         labels_data = np.zeros(shape, dtype=np.uint8)
 
         self.feedback_layer = self.viewer.add_labels(labels_data, name="Current feedback")
@@ -318,10 +340,11 @@ class AnnotationWidget(QtWidgets.QWidget):
         self.viewer.layers.selection.active = self.feedback_layer
 
         self.initialise_widget()
+        self.label_click_counter = ClickCounter(self.feedback_layer, self.clicks_count_label)
 
-        self.click_counter = ClickCounter(self.feedback_layer, self.clicks_count_label)
 
     def on_save_current_feedback(self):
+        """Сохранение объема с текущей обратной связью"""
         for layer in self.viewer.layers:
             if layer.name == "Current feedback":
                 filepath = os.path.join(self.versions_directory_path, "feedback")
@@ -329,28 +352,12 @@ class AnnotationWidget(QtWidgets.QWidget):
                 filepath = os.path.join(filepath, str(len(feedback_versions) + 1))
                 if np.save(filepath, layer.data):
                    #TODO Show message
-                   msg = QMessageBox()  # Pass the parent widget
+                   msg = QMessageBox()
                    msg.setWindowTitle("info")
                    msg.setText("Feedback was saved")
 
-    def fill_versions_list(self):
-        """Заполняет выпадающий список папками с версиями из выбранной директории."""
-        self.versions_combobox.clear()
-        if self.versions_directory_path:
-            try:
-                self.versions_list = [d for d in os.listdir(self.versions_directory_path) if os.path.isdir(os.path.join(self.versions_directory_path, d)) and d!="feedback"]
-                if self.versions_list:
-                    self.versions_combobox.addItems(self.versions_list)
-                else:
-                    self.versions_combobox.addItem("No folders found in directory")
-            except OSError as e:
-                print(f"Error reading directory: {e}")
-                self.versions_combobox.addItem("Error reading directory")
-        else:
-            self.versions_combobox.addItem("No version selected")
-
-
     def fill_feedback_versions_list(self):
+        """Формирование объема из файлов с обратной связью"""
         if self.versions_directory_path:
             self.feedback_versions_path = os.path.join(self.versions_directory_path, "feedback")
             self.feedback_versions_list = [f for f in os.listdir(self.feedback_versions_path)]
@@ -358,11 +365,6 @@ class AnnotationWidget(QtWidgets.QWidget):
             for i, file in enumerate(self.feedback_versions_list):
                 self.fp_feedback_data_array.append(np.load(os.path.join(self.feedback_versions_path, file)))
 
-            check_box = QCheckBox()
-            check_box.clicked.connect(self.on_feedback_checkbox_click)
-            self.fp_versions_checkbox = check_box
-            self.checkbox_grid_label.addWidget(QLabel(str(1)), 0, 1)
-            self.checkbox_grid_label.addWidget(self.fp_versions_checkbox, 1, 1)
 
     def on_feedback_checkbox_click(self, state):
         self.compute_history_fp_volume(self.current_version_name)
@@ -370,23 +372,6 @@ class AnnotationWidget(QtWidgets.QWidget):
              self.viewer.layers.selection.active.data =  self.version_to_init_volume[self.current_version_name]
         elif state == 1:
              self.viewer.layers.selection.active.data = self.data_without_fp[self.current_version_name]
-
-    def on_version_selected(self, index):
-        """Вызывается при выборе версии из выпадающего списка."""
-        if index >= 0 and self.versions_list:  # Проверяем, что есть папки   
-            selected_file = self.versions_list[index]
-            self.current_version_dir_path = os.path.join(self.versions_directory_path, self.versions_list[index])
-            self.current_version_name = self.versions_list[index]
-            self.load_stack()
-            self.current_version_volume = self.image_layer.data
-        else:
-            print("No version selected")
-
-    def load_stack(self):
-        """Загружает все файлы в директории как стек."""
-        self.viewer.open(self.current_version_dir_path)
-        self.image_layer = self.viewer.layers.selection.active
-        self.version_to_init_volume[self.current_version_name] = self.viewer.layers.selection.active.data
         
             
     def create_label_item_array(self):
@@ -398,42 +383,20 @@ class AnnotationWidget(QtWidgets.QWidget):
                 entry.set_color_dictionary(self.color_dict)
                 self.label_items_array.append(entry)
 
-    def _on_layer_selection_change(self, *args, **kwargs):
-        for layer in self.viewer.layers:
-            if self._delete_action in layer.mouse_drag_callbacks:
-                layer.mouse_drag_callbacks.remove(self._delete_action)
-
-        self.active_layer = self.viewer.layers.selection.active
-        if self.active_layer is not None:
-            if self._delete_action not in self.active_layer.mouse_drag_callbacks:
-                if isinstance(self.active_layer, napari.layers.Shapes):
-                    self.active_layer.mouse_drag_callbacks.append(self._delete_action)
-
-    def _delete_action(self, source_layer, event):
-        layer_value = source_layer.get_value(
-            position=event.position,
-            view_direction=event.view_direction,
-            dims_displayed=event.dims_displayed,
-            world=True,
-        )
-        if layer_value is not None:
-            new_labels = source_layer.data
-            new_labels[new_labels == layer_value] = 0
-            source_layer.data = new_labels
-
     def create_segment_item(self):
         """
         Создает список segment_item"""
-        shapes_count = len(self.shapes_layer.data)
-        if shapes_count > len(self.segment_items_array):
+        points_count = len(self.segments_layer.data)
+  
+        if points_count > len(self.segment_items_array):
             index = len(self.segment_items_array)
-            entry = SegmentItem(index, self.shapes_layer)
+            entry = SegmentItem(index, self.segments_layer)
             self.segment_items_array.append(entry)
 
             cur_qWidgets_list = entry.get_qWidget_list()
             for j in range(len(cur_qWidgets_list)):
                 self.segment_grid_layout.addWidget(cur_qWidgets_list[j], index, j)
-            self.update_histogram_on_shape_change(index)
+        
 
 
     def create_standard_label_item_array(self):
@@ -454,27 +417,88 @@ class AnnotationWidget(QtWidgets.QWidget):
         """Инициализация виджета класса разметки."""
 
         self.label_items_array = []
-        self.create_label_item_array()  # populates the label_items_array
+        self.create_label_item_array()
         self.create_standard_label_item_array()
         for i in range(
             len(self.label_items_array)
-        ):  # basically the table rows (i+1 later to jump header)
+        ):  
             cur_qWidgets_list = self.label_items_array[i].get_qWidget_list()
-            # basically go over the columns
+           
             for j in range(len(cur_qWidgets_list)):
                 self.gridLayout.addWidget(cur_qWidgets_list[j], i, j)
-        # update the colors
+       
         self.feedback_layer.colormap = self.colormap
 
+    def calculate_iou(self, pred_mask, gt_mask):
+        """
+        Вычисление IoU (Intersection over Union) между ground truth изображением и разметкой.
+        """
+
+        pred_mask = (pred_mask > 0.5).numpy().astype(np.uint8)
+
+        intersection = np.logical_and(gt_mask, pred_mask).sum()
+        union = np.logical_or(gt_mask, pred_mask).sum()
+
+        if union > 0:
+            iou = intersection / union
+
+        return iou
+    
+    def on_create_segment(self):
+        """Добавляет отрезок в Points layer.  Первая точка - зеленая, вторая - красная."""
+        self.viewer.layers.selection.clear()
+        self.viewer.layers.selection.add(self.segments_layer)
+
+
+    def on_point_added(self):
+        """Обработка события добавления точки в слой отрезков"""    
+        self.has_points = True
+        points = self.segments_layer.data
+        selected = self.segments_layer.selected_data
+        self.segments_layer.blending = 'translucent'
+
+        if len(points) %2 != 0:
+            self.segments_layer.face_color[-1] = [1.0, 0.0, 0.0, 1.0]
+
+    def on_points_inserted(self, event):
+        self.segments_layer = event.value
+        if isinstance(event.value, napari.layers.Points):
+            self.point_click_counter = ClickCounter(self.segments_layer, self.clicks_count_segments)
+        if self.shapes_layer is None and str(event.value) == "Shapes":
+            self.seg_click_counter = ClickCounter(self.shapes_layer, self.clicks_count_segments)
+            self.shapes_layer = event.value
+            self.shapes_layer.events.data.connect(self.print_shape)
+        self.segments_layer.face_color = index_to_color_map[1]
+        self.segments_layer.blending = 'translucent'
+        self.segments_layer.events.data.connect(self.on_point_added)
+
+    def print_shape(self):
+        if len(self.shapes_layer.data) and len(self.shapes_layer.data[0]) > 1 and len(self.shapes_layer.data[0])%2 ==0:
+            first, second = self.shapes_layer.data[-1]
+            print(f"first {first} second {second}")
+            brightness, points = self.bresenham_line(*first, *second)
+            max_diff_idx, beg, end = self.find_boundary_with_margin(brightness)
+            pos_idx = [idx for idx in range(0, beg+1)]
+            neg_idx = [idx for idx in range(end, len(brightness))]
+            pos_points = [[points[idx][1], points[idx][0]] for idx in pos_idx]
+            neg_points = [[points[idx][1], points[idx][0]] for idx in neg_idx]
+            self.pos_points.extend(pos_points)
+            self.neg_points.extend(neg_points)
+            self.brightness_plotter.update_plot(brightness)
+
     def bresenham_line(self, x0, y0, x1, y1):
-        """Алгоритм Брезенхема для растеризации отрезка."""
+        print(f"x0 {x0} y0 {y0} x1 {x1} y1 {y1}")
+        x0 = int(x0)
+        x1 = int(x1)
+        y0 = int(y0)
+        y1 = int(y1)
         points = []
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         sx = 1 if x0 < x1 else -1
         sy = 1 if y0 < y1 else -1
         err = dx - dy
-
+        
         while True:
             points.append((x0, y0))
             if x0 == x1 and y0 == y1:
@@ -486,59 +510,189 @@ class AnnotationWidget(QtWidgets.QWidget):
             if e2 < dx:
                 err += dx
                 y0 += sy
-        return points
+
+        brightness_values = []
+        img = self.get_current_slice_image_data()
+        for point in points:
+            brightness = img.getpixel((point[1], point[0]))  # napari использует (row, col) = (y, x)
+            brightness_values.append(brightness)
+        return brightness_values, points
     
-    def plot_histogram(self, pixel_values):
-        """Построение гистограммы."""
-        fig, ax = plt.subplots()
-        ax.hist(pixel_values, bins=256, range=(0, 256), color='black', alpha=0.75)
-        ax.set_title("Гистограмма интенсивности пикселей отрезка")
-        ax.set_xlabel("Интенсивность")
-        ax.set_ylabel("Частота")
-        plt.show()
-        return fig
 
-    def update_histogram_on_shape_change(self, index):
-        if len(self.shapes_layer.data) > 0:
-            # Получаем координаты отрезка
-            line = self.shapes_layer.data[index]
-            z = self.viewer.dims.current_step[0]
-            print(f'z {z}')
+
+    def boundary_iou(self, pred_mask, gt_mask, dilation_radius=3):
+        """
+        Вычисляет Boundary IoU между предсказанной и истинной масками.
+        
+        Параметры:
+            pred_mask (ndarray): Предсказанная бинарная маска (0 и 1)
+            gt_mask (ndarray): Истинная бинарная маска (0 и 1)
+            dilation_radius (int): Радиус для расширения границ (по умолчанию 3 пикселя)
+        
+        Возвращает:
+            float: Значение Boundary IoU [0, 1]
+        """
+        # Проверка размеров
+        print(f"pred_mask.shape {pred_mask.shape} gt_mask.shape {gt_mask.shape}")
+        assert pred_mask.shape == gt_mask.shape, "Маски должны иметь одинаковый размер"
+        
+        # Находим границы масок
+        pred_mask = (pred_mask > 0.5).numpy().astype(np.uint8)
+
+        pred_boundary = find_boundaries(pred_mask, mode='inner')
+        gt_boundary = find_boundaries(gt_mask, mode='inner')
+        
+        # Расширяем границы с заданным радиусом
+        if dilation_radius > 0:
+            struct = np.ones((2*dilation_radius+1, 2*dilation_radius+1))
+            pred_boundary = binary_dilation(pred_boundary, structure=struct)
+            gt_boundary = binary_dilation(gt_boundary, structure=struct)
+        
+        # Вычисляем пересечение и объединение границ
+        intersection = np.logical_and(pred_boundary, gt_boundary).sum()
+        union = np.logical_or(pred_boundary, gt_boundary).sum()
+        
+        # Избегаем деления на ноль
+        boundary_iou = intersection / union if union > 0 else 0.0
+        
+        return boundary_iou
+    
+    def dice_coefficient(self, pred_mask, gt_mask, epsilon=1e-6):
+        """
+        Вычисляет Dice Coefficient между предсказанной и истинной масками.
+        
+        Параметры:
+            pred_mask (ndarray): Предсказанная бинарная маска (0 и 1)
+            gt_mask (ndarray): Истинная бинарная маска (0 и 1)
+            epsilon (float): Малое число для избежания деления на ноль
+        
+        Возвращает:
+            float: Значение Dice Coefficient [0, 1]
+        """
+        # Проверка размеров
+        assert pred_mask.shape == gt_mask.shape, "Маски должны иметь одинаковый размер"
+        
+        # Преобразование в бинарные массивы (на случай, если значения не 0/1)
+        pred_mask = (pred_mask > 0.5).numpy().astype(np.uint8)
+        gt_mask = (gt_mask > 0.5).astype(np.uint8)
+        
+        # Вычисление пересечения и объединения
+        intersection = np.logical_and(pred_mask, gt_mask).sum()
+        sum_masks = pred_mask.sum() + gt_mask.sum()
+        
+        # Формула Dice: (2 * |X ∩ Y|) / (|X| + |Y|)
+        dice = (2. * intersection + epsilon) / (sum_masks + epsilon)
+        
+        return dice
+
+    def find_boundary_with_margin(self, intensity_profile, margin_ratio=0.1):
+        """y
+        Находит границу между объектом и фоном по максимальному перепаду яркостин
+        и добавляет отступы в обе стороны.
+        
+        Параметры:
+            intensity_profile (np.array): Массив значений яркости вдоль отрезка
+            margin_ratio (float): Доля отрезка для отступа (по умолчанию 1/5)
+        
+        Возвращает:
+            tuple: (индекс границы, индекс левой границы с отступом, индекс правой границы с отступом)
+        """
+        # 1. Вычисляем разницы между соседними пикселями
+        diffs = np.abs(np.diff(intensity_profile))
+        
+        # 2. Находим точку с максимальным перепадом яркости
+        max_diff_idx = np.argmax(diffs)
+        
+        # 3. Вычисляем размер отступа (1/5 длины отрезка)
+        pos_margin = 0.3
+        neg_margin = 0.1
+        margin_right = int(len(intensity_profile) * pos_margin)
+        margin_left = int(len(intensity_profile) * neg_margin)
+        
+        # 4. Определяем границы с отступами
+        left_bound = max(0, max_diff_idx - margin_right)
+        right_bound = min(len(intensity_profile)-1, max_diff_idx + margin_left)
+        
+        return max_diff_idx, left_bound, right_bound
+
+
+    def find_connected_components(self, matrix, start_point, connectivity=8):
+        """
+        Находит все точки, связанные с начальной точкой, с заданной степенью связности.
+        
+        Параметры:
+            matrix (numpy.ndarray): 2D матрица (бинарное изображение, где 1 - объект, 0 - фон)
+            start_point (tuple): (y, x) - начальная точка для поиска компоненты
+            connectivity (int): 4 или 8 (по умолчанию 8)
+        
+        Возвращает:
+            list: список координат (y, x) точек компоненты связности
+        """
+        if connectivity not in [4, 8]:
+            raise ValueError("Связность должна быть 4 или 8")
+        
+        # Проверка валидности начальной точки
+        y, x = start_point
+        if matrix[y, x] == 0:
+            return []
+        
+        # Направления для поиска соседей
+        if connectivity == 4:
+            directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        else:  # 8-связность
+            directions = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                        (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        
+        rows, cols = matrix.shape
+        visited = np.zeros_like(matrix, dtype=bool)
+        component = []
+        queue = deque([start_point])
+        visited[start_point] = True
+        
+        while queue:
+            y, x = queue.popleft()
+            component.append((y, x))
             
-            x0, y0 = int(line[0][0]), int(line[0][1])
-            x1, y1 = int(line[1][0]), int(line[1][1])
+            for dy, dx in directions:
+                ny, nx = y + dy, x + dx
+                if (0 <= ny < rows and 0 <= nx < cols and 
+                    matrix[ny, nx] == 1 and not visited[ny, nx]):
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        
+        return component
 
-            print(f'x0 {x0} y0 {y0} x1 {x1} y1{y1}')
 
-            # Получаем пиксели, через которые проходит отрезок
-            points = self.bresenham_line(x0, y0, x1, y1)
-            image_data = self.init_image.data.compute()
-            pixel_values = [image_data[z, x, y] for x, y in points if 0 <= y < image_data.shape[2] and 0 <= x < image_data.shape[1]]
-            print(pixel_values)
-            clipped_array = np.clip(pixel_values, 0, 1)
-
-            # Scale the values to the range [0, 255]
-            scaled_array = (clipped_array - 0) / (1 - 0) * 255
-
-            # Convert to uint8
-            uint8_array = scaled_array.astype(np.uint8)
-
-            # Обновляем гистограмму
-            self.plot_histogram(uint8_array)
-
-    def calculate_iou(self):
+    def dilation_around_point(self, center, radius, shape):
         """
-        Вычисляет IoU (Intersection over Union) между ground truth изображением и разметкой в napari.
+        Выполняет дилатацию вокруг точки и возвращает список координат точек, входящих в дилатацию.
+
+        Параметры:
+        -----------
+        center : tuple
+            Координаты центральной точки (x, y).
+        radius : int
+            Радиус дилатации (в пикселях).
+        shape : tuple
+            Размеры изображения или области (height, width), чтобы не выходить за границы.
+
+        Возвращает:
+        -----------
+        list of tuples
+            Список координат (x, y) точек, входящих в дилатацию.
         """
+        x_center, y_center = center
+        height, width = shape
 
-        # 2. Получение размеченного изображения из слоя Labels
-        labels_image =  self.network_mask.data
+        # Создаем сетку координат вокруг центра в пределах радиуса
+        points = []
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                x = x_center + dx
+                y = y_center + dy
 
-        intersection = np.logical_and(self.gt_volume, labels_image).sum()
-        union = np.logical_or(self.gt_volume, labels_image).sum()
+                # Проверяем, что точка внутри изображения и в пределах круга (если нужна круговая дилатация)
+                if 0 <= x < width and 0 <= y < height and (dx**2 + dy**2) <= radius**2:
+                    points.append((x, y))
 
-        # 6. Вычисление IoU
-        if union > 0:
-            iou = intersection / union
-
-        return iou
+        return points
