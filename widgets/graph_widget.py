@@ -7,7 +7,7 @@ from PyQt5 import QtGui, QtSql, QtCore, QtWidgets
 
 import pyqtgraph as pg
 
-from shape_analysis import ShapeAnalysis
+from utils.shape_analysis import ShapeAnalysis
 
 class myPyQtGraphWidget(QtWidgets.QWidget):
 	"""

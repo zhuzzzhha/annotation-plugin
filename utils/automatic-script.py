@@ -4,7 +4,7 @@ from PIL import Image
 import cv2
 import numpy as np
 import torch
-from model import ScribblePromptUNet
+from models.model import ScribblePromptUNet
 import torch.nn.functional as F
 from skimage.segmentation import find_boundaries
 from skimage.io import imread 

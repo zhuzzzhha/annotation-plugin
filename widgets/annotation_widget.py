@@ -28,14 +28,12 @@ from napari.utils.colormaps import (
     label_colormap,
 )
 
-from click_counter import ClickCounter
-from graph_widget import myPyQtGraphWidget
-from label_widget import LabelItem
-from model import ScribblePromptUNet
-from plotter_widget import IoUPlotter, BrPlotter
-from segment_anything.sam import ScribblePromptSAM
-from segment_widget import SegmentItem
-from timer_widget import TimerWidget
+from widgets.click_counter import ClickCounter
+from widgets.label_widget import LabelItem
+from models.model import ScribblePromptUNet
+from widgets.plotter_widget import IoUPlotter, BrPlotter
+from widgets.segment_widget import SegmentItem
+from widgets.timer_widget import TimerWidget
 from skimage.transform import resize
 from skimage.draw import line
 from scipy.ndimage import binary_erosion, binary_dilation
@@ -96,11 +94,8 @@ class AnnotationWidget(QtWidgets.QWidget):
         
         #Widgets
         self.brush_iou_plotter = IoUPlotter(self.viewer)
-        self.viewer.window.add_dock_widget(self.brush_iou_plotter, area='bottom', name="IoU/clicks")
         self.segment_iou_plotter = IoUPlotter(self.viewer)
         self.brightness_plotter = BrPlotter(self.viewer)
-        self.viewer.window.add_dock_widget(self.segment_iou_plotter, area='bottom', name="IoU/clicks")
-        self.viewer.window.add_dock_widget(self.brightness_plotter, area="bottom", name="Brightness")
         
         #Colors dict
         self.colors = self.colormap.colors[1:5]
@@ -190,7 +185,7 @@ class AnnotationWidget(QtWidgets.QWidget):
         mask = F.interpolate(mask_unet, size=original_shape, mode='bilinear').squeeze()
 
         
-        bins = np.arange(0.1, 1.1, 0.1
+        bins = np.arange(0.1, 1.1, 0.1)
         quantized_mask = np.digitize(mask.cpu().numpy(), bins)  # Разбиваем на метки 1, 2, ..., 10
 
         # Отображаем в napari (каждый label = свой цвет)
